@@ -39,7 +39,12 @@ export default function App() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [domain, setDomain] = useState("https://YOUR-DOMAIN.netlify.app/");
   const [proxies, setProxies] = useState("");
-  const [intervalTime, setIntervalTime] = useState(5); // seconds
+  const [intervalTime, setIntervalTime] = useState(20); // minutes (default 20min)
+  const [dailyLimit, setDailyLimit] = useState(15); // leads per day
+  const [dailySentCount, setDailySentCount] = useState(0);
+  const [businessHoursOnly, setBusinessHoursOnly] = useState(true);
+  const dailySentRef = React.useRef(0);
+  const sessionStartRef = React.useRef<Date | null>(null);
   const [useHumanTiming, setUseHumanTiming] = useState(true);
   const [stats, setStats] = useState<Stats>({ total: 0, success: 0, errors: 0, startTime: null });
   
@@ -51,7 +56,6 @@ export default function App() {
   const [blacklistedProxies, setBlacklistedProxies] = useState<Set<string>>(new Set());
   const [isDragOver, setIsDragOver] = useState(false);
   const [useIproyalRotation, setUseIproyalRotation] = useState(false);
-  const [useProxy, setUseProxy] = useState(false);
   
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -85,8 +89,91 @@ export default function App() {
     setLogs(prev => [...prev.slice(-49), newLog]);
   };
 
+  // ─── Smart Day-Spread Human Timing Engine ───────────────────────
+  
+  // Check if current time is within business hours (9h-19h)
+  const isBusinessHours = (): boolean => {
+    const now = new Date();
+    const hour = now.getHours();
+    return hour >= 9 && hour < 19;
+  };
+
+  // Calculate ms until next business hours start (9h)
+  const msUntilBusinessHours = (): number => {
+    const now = new Date();
+    const next9am = new Date(now);
+    if (now.getHours() >= 19) {
+      next9am.setDate(next9am.getDate() + 1);
+    }
+    next9am.setHours(9, 0, 0, 0);
+    return next9am.getTime() - now.getTime();
+  };
+
+  // Form filling time per type (simulates reading + typing each step)
+  const getFormFillingDelay = (type: string): number => {
+    const typingDelays: Record<string, [number, number]> = {
+      "Santé & Prévoyance":   [25000, 55000],
+      "Garantie obsèques":    [25000, 55000],
+      "Habitation":           [30000, 65000],
+      "Auto risques aggravés":[28000, 60000],
+      "Assurance Animaux":    [20000, 45000],
+      "Professionnels":       [18000, 40000],
+      "Autre besoin":         [15000, 35000],
+    };
+    const range = typingDelays[type] || [20000, 50000];
+    return Math.floor(range[0] + Math.random() * (range[1] - range[0]));
+  };
+
+  // Smart spacing: spread N leads evenly over business day with human variation
+  const getSmartDelay = (baseMinutes: number): number => {
+    const baseMs = baseMinutes * 60 * 1000;
+    const r = Math.random();
+    let multiplier: number;
+
+    if (r < 0.05) {
+      // 5% — long lunch break or distraction (40-90 min)
+      const breakMs = (40 + Math.random() * 50) * 60 * 1000;
+      const breakMin = Math.round(breakMs / 60000);
+      addLog(`☕ Long break: ${breakMin} min`, "info");
+      return baseMs + breakMs;
+    } else if (r < 0.20) {
+      // 15% — medium pause (1.5x - 2.5x base)
+      multiplier = 1.5 + Math.random();
+    } else if (r < 0.50) {
+      // 30% — slightly above base (1.0x - 1.4x)
+      multiplier = 1.0 + Math.random() * 0.4;
+    } else if (r < 0.80) {
+      // 30% — slightly below base (0.6x - 1.0x)
+      multiplier = 0.6 + Math.random() * 0.4;
+    } else {
+      // 20% — quick (0.3x - 0.6x base = feels like active session)
+      multiplier = 0.3 + Math.random() * 0.3;
+    }
+    return Math.floor(baseMs * multiplier);
+  };
+  // ─────────────────────────────────────────────────────────────────
+
   const executeTask = async () => {
     if (!isRunningRef.current) return;
+
+    // ── Business hours check ──────────────────────────────────────
+    if (businessHoursOnly && !isBusinessHours()) {
+      const waitMs = msUntilBusinessHours();
+      const waitMin = Math.round(waitMs / 60000);
+      addLog(`🌙 Outside business hours. Waiting ${waitMin} min until 9h00...`, "info");
+      timerRef.current = setTimeout(executeTask, waitMs);
+      return;
+    }
+
+    // ── Daily limit check ────────────────────────────────────────
+    if (dailySentRef.current >= dailyLimit) {
+      const waitMs = msUntilBusinessHours();
+      addLog(`✅ Daily limit of ${dailyLimit} leads reached. Resuming tomorrow at 9h00.`, "info");
+      dailySentRef.current = 0;
+      setDailySentCount(0);
+      timerRef.current = setTimeout(executeTask, waitMs);
+      return;
+    }
 
     const proxyList = proxies.split("\n").filter(p => p.trim());
     const availableProxies = proxyList.filter(p => !blacklistedProxies.has(p));
@@ -118,7 +205,7 @@ export default function App() {
     while (attempt < MAX_RETRIES && !success && isRunningRef.current) {
       let selectedProxy: string | null = null;
       let originalProxy: string | null = null;
-      if (useProxy && proxyList.length > 0) {
+      if (proxyList.length > 0) {
         // Sequential rotation skipping blacklisted
         let foundIdx = -1;
         for (let i = 0; i < proxyList.length; i++) {
@@ -148,12 +235,21 @@ export default function App() {
       }
 
       try {
+        // Simulate human typing/reading the form before submitting
+        if (useHumanTiming && userData) {
+          const formType = userData.type || userData.Type || "sante";
+          const typingDelay = getFormFillingDelay(formType);
+          addLog(`⌨️ Filling form... (${Math.round(typingDelay/1000)}s)`, "info");
+          await new Promise(r => setTimeout(r, typingDelay));
+          if (!isRunningRef.current) return;
+        }
+
         const response = await fetch("/api/send-devis", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
             domain, 
-            proxy: useProxy && selectedProxy ? selectedProxy : null,
+            proxy: selectedProxy,
             userData 
           }),
         });
@@ -161,8 +257,10 @@ export default function App() {
         const result = await response.json();
 
         if (result.success) {
+          dailySentRef.current += 1;
+          setDailySentCount(dailySentRef.current);
           setStats(prev => ({ ...prev, total: prev.total + 1, success: prev.success + 1 }));
-          addLog(`[${result.type || "unknown"}] Sent to ${result.email}`, "success");
+          addLog(`[${result.type || "unknown"}] Sent to ${result.email} (${dailySentRef.current}/${dailyLimit} today)`, "success");
           success = true;
         } else {
           // If proxy error specifically, blacklist it
@@ -178,8 +276,8 @@ export default function App() {
         attempt++;
         if (attempt < MAX_RETRIES && isRunningRef.current) {
           addLog(`Attempt ${attempt} failed. Retrying with next proxy...`, "info");
-          // Slight delay before retry
-          await new Promise(r => setTimeout(r, 1000));
+          // Human-like retry pause (3-8s)
+          await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
         } else {
           setStats(prev => ({ ...prev, total: prev.total + 1, errors: prev.errors + 1 }));
           addLog(`Failed after ${attempt} attempts: ${err.message}`, "error");
@@ -187,17 +285,15 @@ export default function App() {
       }
     }
 
-    // Schedule next run with variability if enabled
+    // Schedule next run with smart day-spread timing
     if (isRunningRef.current) {
-      let delay = intervalTime * 1000;
-      if (useHumanTiming) {
-        // Add random jitter between 0% and 50% of the base interval
-        const jitter = Math.random() * (delay * 0.5);
-        // Occasionally pause longer (simulating a "break")
-        const breakPause = Math.random() > 0.95 ? (Math.random() * 5000 + 2000) : 0;
-        delay = Math.floor(delay + jitter + breakPause);
-      }
-      timerRef.current = setTimeout(executeTask, delay);
+      const finalDelay = useHumanTiming
+        ? getSmartDelay(intervalTime)
+        : intervalTime * 60 * 1000;
+      const minutes = Math.round(finalDelay / 60000);
+      const seconds = Math.round((finalDelay % 60000) / 1000);
+      addLog(`⏱ Next form in ${minutes}m ${seconds}s`, "info");
+      timerRef.current = setTimeout(executeTask, finalDelay);
     }
   };
 
@@ -426,58 +522,41 @@ export default function App() {
                 </div>
               ) : null}
 
-              {/* Proxy Settings */}
+              {/* Proxy Settings - Always visible for both modes now for better control */}
               <div>
                 <label className="block text-xs font-medium text-zinc-500 uppercase mb-1.5 ml-1 flex justify-between">
-                  Proxy Rotation
+                  Proxy Rotation 
                   <span className="lowercase text-[10px] opacity-60">Sequential Rotation</span>
                 </label>
-
-                {/* Use Proxy Toggle */}
-                <div className="flex items-center justify-between mb-3 p-2.5 bg-zinc-900/60 rounded-lg border border-zinc-800">
-                  <div>
-                    <span className="text-xs font-medium text-zinc-300">Use Proxy</span>
-                    <p className="text-[10px] text-zinc-500 mt-0.5">Send requests through proxy list</p>
-                  </div>
-                  <button
-                    onClick={() => setUseProxy(prev => !prev)}
-                    className={`relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none ${useProxy ? "bg-indigo-600" : "bg-zinc-700"}`}
-                  >
-                    <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200 ${useProxy ? "translate-x-5" : "translate-x-0"}`} />
-                  </button>
+                <div className="relative">
+                  <Shield className="absolute left-3 top-3 w-4 h-4 text-zinc-600" />
+                  <textarea
+                    value={proxies}
+                    onChange={(e) => setProxies(e.target.value)}
+                    rows={4}
+                    className="w-full bg-black/50 border border-zinc-800 rounded-lg pl-10 pt-2.5 text-sm font-mono focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all outline-none resize-none"
+                    placeholder="user:pass@host:port"
+                  />
                 </div>
-
-                <div className={`transition-opacity duration-200 ${useProxy ? "opacity-100" : "opacity-30 pointer-events-none"}`}>
-                  <div className="relative">
-                    <Shield className="absolute left-3 top-3 w-4 h-4 text-zinc-600" />
-                    <textarea
-                      value={proxies}
-                      onChange={(e) => setProxies(e.target.value)}
-                      rows={4}
-                      className="w-full bg-black/50 border border-zinc-800 rounded-lg pl-10 pt-2.5 text-sm font-mono focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all outline-none resize-none"
-                      placeholder="user:pass@host:port"
+                <div className="mt-3 p-3 bg-indigo-500/5 rounded-lg border border-indigo-500/10 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="iproyal" className="text-[11px] text-zinc-300 font-medium cursor-pointer flex items-center gap-2">
+                      <div className="w-6 h-6 rounded bg-indigo-500/10 flex items-center justify-center">
+                        <Activity className="w-3.5 h-3.5 text-indigo-400" />
+                      </div>
+                      IPRoyal Session Guard
+                    </label>
+                    <input 
+                      type="checkbox" 
+                      id="iproyal" 
+                      checked={useIproyalRotation}
+                      onChange={(e) => setUseIproyalRotation(e.target.checked)}
+                      className="rounded border-zinc-800 bg-zinc-900 text-indigo-600 focus:ring-indigo-500 w-4 h-4"
                     />
                   </div>
-                  <div className="mt-3 p-3 bg-indigo-500/5 rounded-lg border border-indigo-500/10 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <label htmlFor="iproyal" className="text-[11px] text-zinc-300 font-medium cursor-pointer flex items-center gap-2">
-                        <div className="w-6 h-6 rounded bg-indigo-500/10 flex items-center justify-center">
-                          <Activity className="w-3.5 h-3.5 text-indigo-400" />
-                        </div>
-                        IPRoyal Session Guard
-                      </label>
-                      <input
-                        type="checkbox"
-                        id="iproyal"
-                        checked={useIproyalRotation}
-                        onChange={(e) => setUseIproyalRotation(e.target.checked)}
-                        className="rounded border-zinc-800 bg-zinc-900 text-indigo-600 focus:ring-indigo-500 w-4 h-4"
-                      />
-                    </div>
-                    <p className="text-[10px] text-zinc-500 leading-tight">
-                      Automatically injects <code className="text-indigo-400 font-mono">_session-[id]</code> into your IPRoyal residential credentials for sticky session rotation.
-                    </p>
-                  </div>
+                  <p className="text-[10px] text-zinc-500 leading-tight">
+                    Automatically injects <code className="text-indigo-400 font-mono">_session-[id]</code> into your IPRoyal residential credentials for sticky session rotation.
+                  </p>
                 </div>
               </div>
 
@@ -488,6 +567,8 @@ export default function App() {
                   <input
                     type="number"
                     value={intervalTime}
+                    min={8}
+                    max={60}
                     onChange={(e) => setIntervalTime(Math.max(1, parseInt(e.target.value) || 1))}
                     className="w-full bg-black/50 border border-zinc-800 rounded-lg pl-10 h-10 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all outline-none"
                   />
@@ -511,6 +592,61 @@ export default function App() {
                   <p className="text-[10px] text-zinc-500 leading-tight italic">
                     Adds randomized jitter (0-50%) and occasional "human breaks" to make requests look 100% natural.
                   </p>
+                </div>
+              </div>
+
+              {/* Smart Day Spread Settings */}
+              <div className="space-y-3">
+                <label className="block text-xs font-medium text-zinc-500 uppercase mb-1.5 ml-1">
+                  Day Spread Settings
+                </label>
+
+                {/* Business Hours Toggle */}
+                <div className="flex items-center justify-between p-2.5 bg-zinc-900/60 rounded-lg border border-zinc-800">
+                  <div>
+                    <span className="text-xs font-medium text-zinc-300">Business Hours Only</span>
+                    <p className="text-[10px] text-zinc-500 mt-0.5">Send only between 9h00 – 19h00</p>
+                  </div>
+                  <button
+                    onClick={() => setBusinessHoursOnly(prev => !prev)}
+                    className={`relative w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none ${businessHoursOnly ? "bg-indigo-600" : "bg-zinc-700"}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200 ${businessHoursOnly ? "translate-x-5" : "translate-x-0"}`} />
+                  </button>
+                </div>
+
+                {/* Daily Limit */}
+                <div className="p-2.5 bg-zinc-900/60 rounded-lg border border-zinc-800">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-medium text-zinc-300">Daily Limit</span>
+                    <span className="text-xs font-mono text-indigo-400">{dailySentCount} / {dailyLimit} today</span>
+                  </div>
+                  <input
+                    type="number"
+                    min={5}
+                    max={30}
+                    value={dailyLimit}
+                    onChange={(e) => setDailyLimit(Number(e.target.value))}
+                    className="w-full bg-black/50 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-mono text-center focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all outline-none"
+                  />
+                  <p className="text-[10px] text-zinc-500 mt-1.5">Max leads per day (recommended: 10-30)</p>
+                </div>
+
+                {/* Interval between forms */}
+                <div className="p-2.5 bg-zinc-900/60 rounded-lg border border-zinc-800">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-medium text-zinc-300">Base Interval</span>
+                    <span className="text-xs font-mono text-indigo-400">{intervalTime} min</span>
+                  </div>
+                  <input
+                    type="number"
+                    min={8}
+                    max={60}
+                    value={intervalTime}
+                    onChange={(e) => setIntervalTime(Number(e.target.value))}
+                    className="w-full bg-black/50 border border-zinc-800 rounded-lg px-3 py-2 text-sm font-mono text-center focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all outline-none"
+                  />
+                  <p className="text-[10px] text-zinc-500 mt-1.5">Average minutes between each form (min 8)</p>
                 </div>
               </div>
             </div>
